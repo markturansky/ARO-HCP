@@ -60,7 +60,6 @@ endif
 		--confirm-with-what-if \
 		--parameters \
 			configurations/$(AKSCONFIG).bicepparam \
-		--parameters \
 			currentUserId=$(CURRENTUSER) \
 			maestroInfraResourceGroup=$(MAESTRO_INFRA_RESOURCEGROUP)
 cluster-what-if: rg
@@ -73,7 +72,6 @@ endif
 		--template-file templates/$(AKSCONFIG).bicep \
 		--parameters \
 			configurations/$(AKSCONFIG).bicepparam \
-		--parameters \
 			currentUserId=$(CURRENTUSER) \
 			maestroInfraResourceGroup=$(MAESTRO_INFRA_RESOURCEGROUP)
 
