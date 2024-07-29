@@ -269,5 +269,25 @@ module csServiceKeyVaultAccess '../modules/keyvault/keyvault-secret-access.bicep
   }
   dependsOn: [
     serviceKeyVault
+    svcCluster
+  ]
+}
+
+//
+//   I M A G E   S Y N C
+//
+
+var isManagedIdentityPrincipalId = filter(svcCluster.outputs.userAssignedIdentities, id => id.uamiName == 'image-sync')[0].uamiPrincipalID
+
+module imageServiceKeyVaultAccess '../modules/keyvault/keyvault-secret-access.bicep' = {
+  name: guid(serviceKeyVaultName, 'imagesync', 'read')
+  params: {
+    keyVaultName: serviceKeyVaultName
+    roleName: 'Key Vault Secrets User'
+    managedIdentityPrincipalId: isManagedIdentityPrincipalId
+  }
+  dependsOn: [
+    serviceKeyVault
+    svcCluster
   ]
 }
