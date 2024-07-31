@@ -51,23 +51,10 @@ regionalRg:
 		--output none
 .PHONY: regionalRg
 
-dns: regionalRg
-	az deployment group create \
-		--name "$(DEPLOYMENTNAMEREGION)-DNS" \
-		--resource-group $(REGIONAL_RESOURCEGROUP) \
-		--template-file templates/dev-dns.bicep \
-		--confirm-with-what-if \
-		--parameters \
-			configurations/dev-dns.bicepparam \
-		--parameters \
-			currentUserId=$(CURRENTUSER)
-.PHONY: dns
-
 cleanup-orphaned-rolebindings:
 	@scripts/cleanup-orphaned-rolebindings.sh $(RESOURCEGROUP)
 	@scripts/cleanup-orphaned-rolebindings.sh $(REGIONAL_RESOURCEGROUP)
 	@scripts/cleanup-orphaned-rolebindings.sh ${GLOBAL_RESOURCEGROUP}
-	@scripts/cleanup-orphaned-rolebindings.sh aro-hcp-dev
 .PHONY: cleanup-orphaned-rolebindings
 
 acr: regionalRg
@@ -94,7 +81,7 @@ region: regionalRg
 			currentUserId=$(CURRENTUSER)
 .PHONY: region
 
-cluster: rg cleanup-orphaned-rolebindings region dns acr
+cluster: rg cleanup-orphaned-rolebindings region acr
 ifndef AKSCONFIG
 	$(error "Must set AKSCONFIG")
 endif
