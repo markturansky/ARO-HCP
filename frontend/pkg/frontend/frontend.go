@@ -14,21 +14,19 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"sync/atomic"
 
-	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/google/uuid"
-	sdk "github.com/openshift-online/ocm-sdk-go"
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 
 	"github.com/Azure/ARO-HCP/internal/api"
 	"github.com/Azure/ARO-HCP/internal/api/arm"
 	"github.com/Azure/ARO-HCP/internal/database"
+	"github.com/Azure/ARO-HCP/internal/ocm"
 )
 
 type Frontend struct {
-	clusterServiceConfig ClusterServiceConfig
+	clusterServiceConfig ocm.ClusterServiceConfig
 	logger               *slog.Logger
 	listener             net.Listener
 	server               http.Server
@@ -39,24 +37,7 @@ type Frontend struct {
 	region               string
 }
 
-type ClusterServiceConfig struct {
-	// Conn is an ocm-sdk-go connection to Cluster Service
-	Conn *sdk.Connection
-
-	// ProvisionShardID sets the provision_shard_id property for all cluster requests to Cluster Service, which pins all
-	// cluster requests to Cluster Service to a specific shard during testing
-	ProvisionShardID *string
-
-	// ProvisionerNoOpProvision sets the provisioner_noop_provision property for all cluster requests to Cluster
-	// Service, which short-circuits the full provision flow during testing
-	ProvisionerNoOpProvision bool
-
-	// ProvisionerNoOpDeprovision sets the provisioner_noop_deprovision property for all cluster requests to Cluster
-	// Service, which short-circuits the full deprovision flow during testing
-	ProvisionerNoOpDeprovision bool
-}
-
-func NewFrontend(logger *slog.Logger, listener net.Listener, emitter Emitter, dbClient database.DBClient, region string, csCfg ClusterServiceConfig) *Frontend {
+func NewFrontend(logger *slog.Logger, listener net.Listener, emitter Emitter, dbClient database.DBClient, region string, csCfg ocm.ClusterServiceConfig) *Frontend {
 	f := &Frontend{
 		clusterServiceConfig: csCfg,
 		logger:               logger,
@@ -254,7 +235,7 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 		}
 	}
 
-	cluster, err := f.GetCSCluster(doc.ClusterID)
+	cluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("cluster not found in clusters-service: %v", err))
 		writer.WriteHeader(http.StatusNoContent)
@@ -334,7 +315,7 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 	var hcpCluster *api.HCPOpenShiftCluster
 	var csResp *cmv1.ClusterGetResponse
 	if doc.ClusterID != "" {
-		csResp, err = f.GetCSCluster(doc.ClusterID)
+		csResp, err = f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 		if err != nil {
 			f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", resourceID, err))
 			arm.WriteInternalServerError(writer)
@@ -398,7 +379,7 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 		return
 	}
 
-	req, err := f.PostCSCluster(newCsCluster)
+	req, err := f.clusterServiceConfig.PostCSCluster(newCsCluster)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
@@ -458,7 +439,7 @@ func (f *Frontend) ArmResourceUpdate(writer http.ResponseWriter, request *http.R
 		return
 	}
 
-	csResp, err := f.GetCSCluster(doc.ClusterID)
+	csResp, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", resourceID, err))
 		arm.WriteInternalServerError(writer)
@@ -503,7 +484,7 @@ func (f *Frontend) ArmResourceUpdate(writer http.ResponseWriter, request *http.R
 		return
 	}
 
-	req, err := f.UpdateCSCluster(doc.ClusterID, newCsCluster)
+	req, err := f.clusterServiceConfig.UpdateCSCluster(doc.ClusterID, newCsCluster)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
@@ -559,7 +540,7 @@ func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.R
 	}
 
 	if doc.ClusterID != "" {
-		_, err = f.DeleteCSCluster(doc.ClusterID)
+		_, err = f.clusterServiceConfig.DeleteCSCluster(doc.ClusterID)
 		if err != nil {
 			f.logger.Error(fmt.Sprintf("failed to delete cluster %s: %v", doc.ClusterID, err))
 			arm.WriteInternalServerError(writer)
@@ -829,28 +810,24 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
+	nodePoolResourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	f.logger.Info(fmt.Sprintf("%s: CreateNodePool", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	nodePoolResourceID := request.URL.Path
-
-	nodePoolResourceIDObject, err := azcorearm.ParseResourceID(nodePoolResourceID)
-	if err != nil {
-		f.logger.Error(fmt.Sprintf("could not parse resource ID: %v", err))
+	clusterResourceID := nodePoolResourceID.Parent
+	if clusterResourceID == nil {
+		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %s", nodePoolResourceID))
 		arm.WriteInternalServerError(writer)
 		return
 	}
-
-	clusterResourceIDObject := nodePoolResourceIDObject.Parent
-	if clusterResourceIDObject == nil {
-		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %v", nodePoolResourceID))
-		arm.WriteInternalServerError(writer)
-		return
-	}
-	clusterResourceID := strings.ToLower(clusterResourceIDObject.String())
 
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID, subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster %s when creating node pool", clusterResourceID))
@@ -862,7 +839,7 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	csResp, err := f.GetCSCluster(clusterDoc.ClusterID)
+	csResp, err := f.clusterServiceConfig.GetCSCluster(clusterDoc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", clusterResourceID, err))
 		arm.WriteInternalServerError(writer)
@@ -870,19 +847,19 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 	}
 
 	if csResp.Body().State() == cmv1.ClusterStateUninstalling {
-		f.logger.Error(fmt.Sprintf("failed to create nodepool for cluster %v as it is in %v state", clusterResourceID, cmv1.ClusterStateUninstalling))
+		f.logger.Error(fmt.Sprintf("failed to create nodepool for cluster %s as it is in %v state", clusterResourceID, cmv1.ClusterStateUninstalling))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
+	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Info(fmt.Sprintf("creating nodepool document for %s", nodePoolResourceID))
 
 			nodePoolDoc = &database.NodePoolDocument{
 				ID:           uuid.New().String(),
-				Key:          nodePoolResourceID,
+				Key:          nodePoolResourceID.String(),
 				PartitionKey: subscriptionID,
 				SystemData:   systemData,
 			}
@@ -929,7 +906,7 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	req, err := f.CreateCSNodePool(clusterDoc.ClusterID, newCsNodePool)
+	req, err := f.clusterServiceConfig.CreateCSNodePool(clusterDoc.ClusterID, newCsNodePool)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
@@ -974,28 +951,24 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
+	nodePoolResourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	f.logger.Info(fmt.Sprintf("%s: GetNodePools", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	nodePoolResourceID := request.URL.Path
-
-	nodePoolResourceIDObject, err := azcorearm.ParseResourceID(nodePoolResourceID)
-	if err != nil {
-		f.logger.Error(fmt.Sprintf("could not parse resource ID: %v", err))
+	clusterResourceID := nodePoolResourceID.Parent
+	if clusterResourceID == nil {
+		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %s", nodePoolResourceID))
 		arm.WriteInternalServerError(writer)
 		return
 	}
-
-	clusterResourceIDObject := nodePoolResourceIDObject.Parent
-	if clusterResourceIDObject == nil {
-		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %v", nodePoolResourceID))
-		arm.WriteInternalServerError(writer)
-		return
-	}
-	clusterResourceID := strings.ToLower(clusterResourceIDObject.String())
 
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID, subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing cluster document not found for cluster: %s on GET node pool by name", clusterResourceID))
@@ -1008,7 +981,7 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
-	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
+	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing node pool document not found for node pool: %s on GET node pool by name", nodePoolResourceID))
@@ -1025,7 +998,7 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 
 	f.logger.Info(fmt.Sprintf("targetNodePoolName is : %v", targetNodePoolName))
 
-	nodePoolGetResponse, err := f.GetCSNodePool(clusterDoc.ClusterID, targetNodePoolName)
+	nodePoolGetResponse, err := f.clusterServiceConfig.GetCSNodePool(clusterDoc.ClusterID, targetNodePoolName)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("node pool not found in clusters-service: %v", err))
 		writer.WriteHeader(http.StatusNoContent)
@@ -1066,28 +1039,24 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
+	nodePoolResourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	f.logger.Info(fmt.Sprintf("%s: DeleteNodePool", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	nodePoolResourceID := request.URL.Path
-
-	nodePoolResourceIDObject, err := azcorearm.ParseResourceID(nodePoolResourceID)
-	if err != nil {
-		f.logger.Error(fmt.Sprintf("could not parse resource ID: %v", err))
+	clusterResourceID := nodePoolResourceID.Parent
+	if clusterResourceID == nil {
+		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %s", nodePoolResourceID))
 		arm.WriteInternalServerError(writer)
 		return
 	}
-
-	clusterResourceIDObject := nodePoolResourceIDObject.Parent
-	if clusterResourceIDObject == nil {
-		f.logger.Error(fmt.Sprintf("failed to obtain Azure parent resourceID for nodepool %v", nodePoolResourceID))
-		arm.WriteInternalServerError(writer)
-		return
-	}
-	clusterResourceID := strings.ToLower(clusterResourceIDObject.String())
 
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID, subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster %s when deleting node pool", clusterResourceID))
@@ -1099,7 +1068,7 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	doc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
+	doc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("nodepool document cannot be deleted -- nodepool document not found for %s", nodePoolResourceID))
@@ -1118,14 +1087,14 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	_, err = f.DeleteCSNodePool(clusterDoc.ClusterID, doc.NodePoolID)
+	_, err = f.clusterServiceConfig.DeleteCSNodePool(clusterDoc.ClusterID, doc.NodePoolID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to delete nodepool %s: %v", doc.NodePoolID, err))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	err = f.dbClient.DeleteNodePoolDoc(ctx, nodePoolResourceID)
+	err = f.dbClient.DeleteNodePoolDoc(ctx, nodePoolResourceID.String())
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("nodepool document cannot be deleted -- nodepool document not found for %s", nodePoolResourceID))

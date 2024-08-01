@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	configv1 "github.com/openshift/api/config/v1"
 
@@ -15,7 +14,6 @@ import (
 const (
 	csCloudProvider    string = "azure"
 	csProductId        string = "aro"
-	resourceType       string = "Microsoft.RedHatOpenShift/hcpOpenShiftClusters"
 	csHypershifEnabled bool   = true
 	csMultiAzEnabled   bool   = true
 	csCCSEnabled       bool   = true
@@ -27,7 +25,7 @@ func (f *Frontend) ConvertCStoHCPOpenShiftCluster(systemData *arm.SystemData, cl
 	resourceGroupName := cluster.Azure().ResourceGroupName()
 	resourceName := cluster.Azure().ResourceName()
 	subID := cluster.Azure().SubscriptionID()
-	resourceID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/%s/%s", subID, resourceGroupName, resourceType, resourceName)
+	resourceID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/%s/%s", subID, resourceGroupName, api.ResourceType, resourceName)
 
 	hcpcluster := &api.HCPOpenShiftCluster{
 		TrackedResource: arm.TrackedResource{
@@ -36,7 +34,7 @@ func (f *Frontend) ConvertCStoHCPOpenShiftCluster(systemData *arm.SystemData, cl
 			Resource: arm.Resource{
 				ID:         resourceID,
 				Name:       resourceName,
-				Type:       resourceType,
+				Type:       api.ResourceType,
 				SystemData: systemData,
 			},
 		},
@@ -103,13 +101,9 @@ func (f *Frontend) ConvertCStoHCPOpenShiftCluster(systemData *arm.SystemData, cl
 
 // BuildCSCluster creates a CS Cluster object from an HCPOpenShiftCluster object
 func (f *Frontend) BuildCSCluster(ctx context.Context, hcpCluster *api.HCPOpenShiftCluster) (*cmv1.Cluster, error) {
-	originalPath, err := OriginalPathFromContext(ctx)
+	resourceID, err := ResourceIDFromContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("could not get original path: %w", err)
-	}
-	resourceID, err := azcorearm.ParseResourceID(originalPath)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse resource ID: %w", err)
+		return nil, fmt.Errorf("could not get parsed resource ID: %w", err)
 	}
 	tenantID, err := TenantIDFromContext(ctx)
 	if err != nil {
@@ -180,17 +174,9 @@ func (f *Frontend) BuildCSCluster(ctx context.Context, hcpCluster *api.HCPOpenSh
 
 // ConvertCStoNodepool converts a CS Node Pool object into HCPOpenShiftClusterNodePool object
 func (f *Frontend) ConvertCStoNodepool(ctx context.Context, systemData *arm.SystemData, np *cmv1.NodePool) (*api.HCPOpenShiftClusterNodePool, error) {
-	originalPath, err := OriginalPathFromContext(ctx)
+	resourceID, err := ResourceIDFromContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("could not get original path: %w", err)
-	}
-	resourceID, err := azcorearm.ParseResourceID(originalPath)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse resource ID: %w", err)
-	}
-	resourceType, err := azcorearm.ParseResourceType(originalPath)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse resource type: %w", err)
+		return nil, fmt.Errorf("could not get parsed resource ID: %w", err)
 	}
 
 	nodePool := &api.HCPOpenShiftClusterNodePool{
@@ -198,7 +184,7 @@ func (f *Frontend) ConvertCStoNodepool(ctx context.Context, systemData *arm.Syst
 			Resource: arm.Resource{
 				ID:         resourceID.String(),
 				Name:       resourceID.Name,
-				Type:       resourceType.String(),
+				Type:       resourceID.ResourceType.String(),
 				SystemData: systemData,
 			},
 		},
@@ -285,64 +271,4 @@ func (f *Frontend) BuildCSNodepool(ctx context.Context, nodepool *api.HCPOpenShi
 	}
 
 	return npBuilder.Build()
-}
-
-// GetCSCluster creates and sends a GET request to fetch a cluster from Clusters Service
-func (f *Frontend) GetCSCluster(clusterID string) (*cmv1.ClusterGetResponse, error) {
-	cluster, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).Get().Send()
-	if err != nil {
-		return nil, err
-	}
-	return cluster, nil
-}
-
-// PostCSCluster creates and sends a POST request to create a cluster in Clusters Service
-func (f *Frontend) PostCSCluster(cluster *cmv1.Cluster) (*cmv1.ClustersAddResponse, error) {
-	resp, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Add().Body(cluster).Send()
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// UpdateCSCluster sends a POST request to update a cluster in Clusters Service
-func (f *Frontend) UpdateCSCluster(clusterID string, cluster *cmv1.Cluster) (*cmv1.ClusterUpdateResponse, error) {
-	resp, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).Update().Body(cluster).Send()
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// DeleteCSCluster creates and sends a DELETE request to delete a cluster from Clusters Service
-func (f *Frontend) DeleteCSCluster(clusterID string) (*cmv1.ClusterDeleteResponse, error) {
-	resp, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).Delete().Send()
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (f *Frontend) GetCSNodePool(clusterID, nodePoolID string) (*cmv1.NodePoolGetResponse, error) {
-	nodePoolGetResponse, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).NodePools().NodePool(nodePoolID).Get().Send()
-	if err != nil {
-		return nil, err
-	}
-	return nodePoolGetResponse, nil
-}
-
-func (f *Frontend) CreateCSNodePool(clusterID string, nodePool *cmv1.NodePool) (*cmv1.NodePoolsAddResponse, error) {
-	resp, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).NodePools().Add().Body(nodePool).Send()
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (f *Frontend) DeleteCSNodePool(clusterID, nodePoolID string) (*cmv1.NodePoolDeleteResponse, error) {
-	resp, err := f.clusterServiceConfig.Conn.ClustersMgmt().V1().Clusters().Cluster(clusterID).NodePools().NodePool(nodePoolID).Delete().Send()
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
 }
