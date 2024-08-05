@@ -207,6 +207,9 @@ func (f *Frontend) ArmResourceList(writer http.ResponseWriter, request *http.Req
 	writer.WriteHeader(http.StatusOK)
 }
 
+// ArmResourceRead implements the GET single resource API contract for ARM
+// * 200 If the resource exists
+// * 404 If the resource does not exist
 func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Request) {
 	ctx := request.Context()
 
@@ -217,16 +220,22 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
+	resourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	f.logger.Info(fmt.Sprintf("%s: ArmResourceRead", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	resourceID := request.URL.Path
-	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	doc, err := f.dbClient.GetClusterDoc(ctx, resourceID, subscriptionID)
+	doc, err := f.dbClient.GetClusterDoc(ctx, resourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster: %s", resourceID))
-			writer.WriteHeader(http.StatusNoContent)
+
+			originalPath, _ := OriginalPathFromContext(ctx)
+			arm.WriteResourceNotFoundError(writer, originalPath)
 			return
 		} else {
 			f.logger.Error(err.Error())
@@ -235,14 +244,16 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 		}
 	}
 
-	cluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
+	csCluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("cluster not found in clusters-service: %v", err))
-		writer.WriteHeader(http.StatusNoContent)
+
+		originalPath, _ := OriginalPathFromContext(ctx)
+		arm.WriteResourceNotFoundError(writer, originalPath)
 		return
 	}
 
-	hcpCluster, err := f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, cluster.Body())
+	hcpCluster, err := f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, csCluster)
 	if err != nil {
 		// Should never happen currently
 		f.logger.Error(err.Error())
@@ -279,6 +290,13 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 		return
 	}
 
+	resourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	systemData, err := SystemDataFromContext(ctx)
 	if err != nil {
 		f.logger.Error(err.Error())
@@ -288,20 +306,18 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 
 	f.logger.Info(fmt.Sprintf("%s: ArmResourceCreateOrUpdate", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	resourceID := request.URL.Path
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
 
 	var doc *database.HCPOpenShiftClusterDocument
 	var updating bool = true
-	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID, subscriptionID)
+	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			updating = false
 			f.logger.Info(fmt.Sprintf("existing document not found for cluster - creating one for %s", resourceID))
 			doc = &database.HCPOpenShiftClusterDocument{
 				ID:           uuid.New().String(),
-				Key:          resourceID,
+				Key:          resourceID.String(),
 				PartitionKey: subscriptionID,
 				SystemData:   systemData,
 			}
@@ -313,22 +329,19 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 	}
 
 	var hcpCluster *api.HCPOpenShiftCluster
-	var csResp *cmv1.ClusterGetResponse
 	if doc.ClusterID != "" {
-		csResp, err = f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
+		csCluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 		if err != nil {
 			f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", resourceID, err))
 			arm.WriteInternalServerError(writer)
 			return
 		}
-		if csResp.Body() != nil {
-			hcpCluster, err = f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, csResp.Body())
-			if err != nil {
-				// Should never happen currently
-				f.logger.Error(err.Error())
-				arm.WriteInternalServerError(writer)
-				return
-			}
+		hcpCluster, err = f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, csCluster)
+		if err != nil {
+			// Should never happen currently
+			f.logger.Error(err.Error())
+			arm.WriteInternalServerError(writer)
+			return
 		}
 	}
 	versionedCurrentCluster := versionedInterface.NewHCPOpenShiftCluster(hcpCluster)
@@ -342,9 +355,7 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 			// PATCH request will not create a new cluster.
 			originalPath, _ := OriginalPathFromContext(ctx)
 			f.logger.Error("Resource not found")
-			arm.WriteError(
-				writer, http.StatusNotFound, arm.CloudErrorCodeNotFound,
-				originalPath, "Resource not found")
+			arm.WriteResourceNotFoundError(writer, originalPath)
 			return
 		}
 		versionedRequestCluster = versionedInterface.NewHCPOpenShiftCluster(hcpCluster)
@@ -379,13 +390,13 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 		return
 	}
 
-	req, err := f.clusterServiceConfig.PostCSCluster(newCsCluster)
+	csCluster, err := f.clusterServiceConfig.PostCSCluster(newCsCluster)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
 		return
 	}
-	doc.ClusterID = req.Body().ID()
+	doc.ClusterID = csCluster.ID()
 	err = f.dbClient.SetClusterDoc(ctx, doc)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to create document for resource %s: %v", resourceID, err))
@@ -423,35 +434,36 @@ func (f *Frontend) ArmResourceUpdate(writer http.ResponseWriter, request *http.R
 		return
 	}
 
-	f.logger.Info(fmt.Sprintf("%s: ArmResourceUpdate", versionedInterface))
+	resourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
 
-	// URL path is already lowercased by middleware.
-	resourceID := request.URL.Path
-	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
+	f.logger.Info(fmt.Sprintf("%s: ArmResourceUpdate", versionedInterface))
 
 	var hcpCluster *api.HCPOpenShiftCluster
 	var doc *database.HCPOpenShiftClusterDocument
 	var updating bool = true
-	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID, subscriptionID)
+	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to fetch document for %s: %v", resourceID, err))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	csResp, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
+	csCluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", resourceID, err))
 		arm.WriteInternalServerError(writer)
 		return
 	}
-	if csResp.Body() != nil {
-		hcpCluster, err = f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, csResp.Body())
-		if err != nil {
-			f.logger.Error(err.Error())
-			arm.WriteInternalServerError(writer)
-			return
-		}
+	hcpCluster, err = f.ConvertCStoHCPOpenShiftCluster(doc.SystemData, csCluster)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
 	}
 
 	versionedCurrentCluster := versionedInterface.NewHCPOpenShiftCluster(hcpCluster)
@@ -484,13 +496,13 @@ func (f *Frontend) ArmResourceUpdate(writer http.ResponseWriter, request *http.R
 		return
 	}
 
-	req, err := f.clusterServiceConfig.UpdateCSCluster(doc.ClusterID, newCsCluster)
+	csCluster, err = f.clusterServiceConfig.UpdateCSCluster(doc.ClusterID, newCsCluster)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
 		return
 	}
-	doc.ClusterID = req.Body().ID()
+	doc.ClusterID = csCluster.ID()
 	err = f.dbClient.SetClusterDoc(ctx, doc)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to update document for resource %s: %v", doc.ClusterID, err))
@@ -509,6 +521,10 @@ func (f *Frontend) ArmResourceUpdate(writer http.ResponseWriter, request *http.R
 	}
 }
 
+// ArmResourceDelete implements the deletion API contract for ARM
+// * 200 if a deletion is successful
+// * 202 if an asynchronous delete is initiated
+// * 204 if a well-formed request attempts to delete a nonexistent resource
 func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.Request) {
 	ctx := request.Context()
 
@@ -519,14 +535,17 @@ func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.R
 		return
 	}
 
+	resourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	f.logger.Info(fmt.Sprintf("%s: ArmResourceDelete", versionedInterface))
 
-	// URL path is already lowercased by middleware.
-	resourceID := request.URL.Path
-	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-
 	var doc *database.HCPOpenShiftClusterDocument
-	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID, subscriptionID)
+	doc, err = f.dbClient.GetClusterDoc(ctx, resourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Info(fmt.Sprintf("cluster document cannot be deleted -- document not found for %s", resourceID))
@@ -540,7 +559,7 @@ func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.R
 	}
 
 	if doc.ClusterID != "" {
-		_, err = f.clusterServiceConfig.DeleteCSCluster(doc.ClusterID)
+		err = f.clusterServiceConfig.DeleteCSCluster(doc.ClusterID)
 		if err != nil {
 			f.logger.Error(fmt.Sprintf("failed to delete cluster %s: %v", doc.ClusterID, err))
 			arm.WriteInternalServerError(writer)
@@ -548,7 +567,7 @@ func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.R
 		}
 	}
 
-	err = f.dbClient.DeleteClusterDoc(ctx, resourceID, subscriptionID)
+	err = f.dbClient.DeleteClusterDoc(ctx, resourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Info(fmt.Sprintf("cluster document cannot be deleted -- document not found for %s", resourceID))
@@ -562,7 +581,8 @@ func (f *Frontend) ArmResourceDelete(writer http.ResponseWriter, request *http.R
 	}
 	f.logger.Info(fmt.Sprintf("document deleted for resource %s", resourceID))
 
-	writer.WriteHeader(http.StatusAccepted)
+	// TODO: Eventually this will be an asynchronous delete and need to return a 202
+	writer.WriteHeader(http.StatusOK)
 }
 
 func (f *Frontend) ArmResourceAction(writer http.ResponseWriter, request *http.Request) {
@@ -588,7 +608,9 @@ func (f *Frontend) ArmSubscriptionGet(writer http.ResponseWriter, request *http.
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("document not found for subscription %s", subscriptionID))
-			writer.WriteHeader(http.StatusNotFound)
+
+			originalPath, _ := OriginalPathFromContext(ctx)
+			arm.WriteResourceNotFoundError(writer, originalPath)
 			return
 		} else {
 			f.logger.Error(err.Error())
@@ -827,7 +849,7 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 	}
 
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster %s when creating node pool", clusterResourceID))
@@ -839,20 +861,20 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	csResp, err := f.clusterServiceConfig.GetCSCluster(clusterDoc.ClusterID)
+	csCluster, err := f.clusterServiceConfig.GetCSCluster(clusterDoc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to fetch CS cluster for %s: %v", clusterResourceID, err))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	if csResp.Body().State() == cmv1.ClusterStateUninstalling {
+	if csCluster.State() == cmv1.ClusterStateUninstalling {
 		f.logger.Error(fmt.Sprintf("failed to create nodepool for cluster %s as it is in %v state", clusterResourceID, cmv1.ClusterStateUninstalling))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
+	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Info(fmt.Sprintf("creating nodepool document for %s", nodePoolResourceID))
@@ -906,15 +928,14 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	req, err := f.clusterServiceConfig.CreateCSNodePool(clusterDoc.ClusterID, newCsNodePool)
+	csNodePool, err := f.clusterServiceConfig.CreateCSNodePool(clusterDoc.ClusterID, newCsNodePool)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	nodePoolID := req.Body().ID()
-	nodePoolDoc.NodePoolID = nodePoolID
+	nodePoolDoc.NodePoolID = csNodePool.ID()
 	err = f.dbClient.SetNodePoolDoc(ctx, nodePoolDoc)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to create nodepool document for resource %s: %v", nodePoolResourceID, err))
@@ -967,8 +988,7 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
-	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing cluster document not found for cluster: %s on GET node pool by name", clusterResourceID))
@@ -981,7 +1001,7 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
-	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
+	nodePoolDoc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing node pool document not found for node pool: %s on GET node pool by name", nodePoolResourceID))
@@ -998,14 +1018,13 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 
 	f.logger.Info(fmt.Sprintf("targetNodePoolName is : %v", targetNodePoolName))
 
-	nodePoolGetResponse, err := f.clusterServiceConfig.GetCSNodePool(clusterDoc.ClusterID, targetNodePoolName)
+	nodePool, err := f.clusterServiceConfig.GetCSNodePool(clusterDoc.ClusterID, targetNodePoolName)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("node pool not found in clusters-service: %v", err))
 		writer.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	nodePool := nodePoolGetResponse.Body()
 	aroNodePool, err := f.ConvertCStoNodepool(ctx, nodePoolDoc.SystemData, nodePool)
 	if err != nil {
 		f.logger.Error(err.Error())
@@ -1055,12 +1074,13 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
-	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID.String(), subscriptionID)
+	clusterDoc, err := f.dbClient.GetClusterDoc(ctx, clusterResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster %s when deleting node pool", clusterResourceID))
-			writer.WriteHeader(http.StatusNotFound)
+
+			originalPath, _ := OriginalPathFromContext(ctx)
+			arm.WriteResourceNotFoundError(writer, originalPath)
 			return
 		}
 		f.logger.Error(fmt.Sprintf("failed to fetch cluster document for %s when deleting node pool: %v", clusterResourceID, err))
@@ -1068,7 +1088,7 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	doc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID.String())
+	doc, err := f.dbClient.GetNodePoolDoc(ctx, nodePoolResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("nodepool document cannot be deleted -- nodepool document not found for %s", nodePoolResourceID))
@@ -1087,14 +1107,14 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	_, err = f.clusterServiceConfig.DeleteCSNodePool(clusterDoc.ClusterID, doc.NodePoolID)
+	err = f.clusterServiceConfig.DeleteCSNodePool(clusterDoc.ClusterID, doc.NodePoolID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("failed to delete nodepool %s: %v", doc.NodePoolID, err))
 		arm.WriteInternalServerError(writer)
 		return
 	}
 
-	err = f.dbClient.DeleteNodePoolDoc(ctx, nodePoolResourceID.String())
+	err = f.dbClient.DeleteNodePoolDoc(ctx, nodePoolResourceID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("nodepool document cannot be deleted -- nodepool document not found for %s", nodePoolResourceID))
