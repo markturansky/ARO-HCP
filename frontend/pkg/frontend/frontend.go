@@ -34,10 +34,10 @@ type Frontend struct {
 	ready                atomic.Value
 	done                 chan struct{}
 	metrics              Emitter
-	region               string
+	location             string
 }
 
-func NewFrontend(logger *slog.Logger, listener net.Listener, emitter Emitter, dbClient database.DBClient, region string, csCfg ocm.ClusterServiceConfig) *Frontend {
+func NewFrontend(logger *slog.Logger, listener net.Listener, emitter Emitter, dbClient database.DBClient, location string, csCfg ocm.ClusterServiceConfig) *Frontend {
 	f := &Frontend{
 		clusterServiceConfig: csCfg,
 		logger:               logger,
@@ -51,7 +51,7 @@ func NewFrontend(logger *slog.Logger, listener net.Listener, emitter Emitter, db
 		},
 		dbClient: dbClient,
 		done:     make(chan struct{}),
-		region:   region,
+		location: location,
 	}
 
 	f.server.Handler = f.routes()
@@ -203,8 +203,6 @@ func (f *Frontend) ArmResourceList(writer http.ResponseWriter, request *http.Req
 	if err != nil {
 		f.logger.Error(err.Error())
 	}
-
-	writer.WriteHeader(http.StatusOK)
 }
 
 // ArmResourceRead implements the GET single resource API contract for ARM
@@ -233,9 +231,7 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster: %s", resourceID))
-
-			originalPath, _ := OriginalPathFromContext(ctx)
-			arm.WriteResourceNotFoundError(writer, originalPath)
+			arm.WriteResourceNotFoundError(writer, resourceID)
 			return
 		} else {
 			f.logger.Error(err.Error())
@@ -247,9 +243,7 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 	csCluster, err := f.clusterServiceConfig.GetCSCluster(doc.ClusterID)
 	if err != nil {
 		f.logger.Error(fmt.Sprintf("cluster not found in clusters-service: %v", err))
-
-		originalPath, _ := OriginalPathFromContext(ctx)
-		arm.WriteResourceNotFoundError(writer, originalPath)
+		arm.WriteResourceNotFoundError(writer, resourceID)
 		return
 	}
 
@@ -272,7 +266,6 @@ func (f *Frontend) ArmResourceRead(writer http.ResponseWriter, request *http.Req
 	if err != nil {
 		f.logger.Error(err.Error())
 	}
-	writer.WriteHeader(http.StatusOK)
 }
 
 func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request *http.Request) {
@@ -353,9 +346,8 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 	case http.MethodPatch:
 		if hcpCluster == nil {
 			// PATCH request will not create a new cluster.
-			originalPath, _ := OriginalPathFromContext(ctx)
 			f.logger.Error("Resource not found")
-			arm.WriteResourceNotFoundError(writer, originalPath)
+			arm.WriteResourceNotFoundError(writer, resourceID)
 			return
 		}
 		versionedRequestCluster = versionedInterface.NewHCPOpenShiftCluster(hcpCluster)
@@ -409,16 +401,17 @@ func (f *Frontend) ArmResourceCreateOrUpdate(writer http.ResponseWriter, request
 		arm.WriteInternalServerError(writer)
 		return
 	}
-	_, err = writer.Write(resp)
-	if err != nil {
-		f.logger.Error(err.Error())
-	}
 
 	switch request.Method {
 	case http.MethodPut:
 		writer.WriteHeader(http.StatusCreated)
 	case http.MethodPatch:
 		writer.WriteHeader(http.StatusAccepted)
+	}
+
+	_, err = writer.Write(resp)
+	if err != nil {
+		f.logger.Error(err.Error())
 	}
 }
 
@@ -604,13 +597,18 @@ func (f *Frontend) ArmSubscriptionGet(writer http.ResponseWriter, request *http.
 	ctx := request.Context()
 	subscriptionID := request.PathValue(PathSegmentSubscriptionID)
 
+	resourceID, err := ResourceIDFromContext(ctx)
+	if err != nil {
+		f.logger.Error(err.Error())
+		arm.WriteInternalServerError(writer)
+		return
+	}
+
 	doc, err := f.dbClient.GetSubscriptionDoc(ctx, subscriptionID)
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("document not found for subscription %s", subscriptionID))
-
-			originalPath, _ := OriginalPathFromContext(ctx)
-			arm.WriteResourceNotFoundError(writer, originalPath)
+			arm.WriteResourceNotFoundError(writer, resourceID)
 			return
 		} else {
 			f.logger.Error(err.Error())
@@ -626,7 +624,6 @@ func (f *Frontend) ArmSubscriptionGet(writer http.ResponseWriter, request *http.
 		return
 	}
 
-	writer.WriteHeader(http.StatusOK)
 	_, err = writer.Write(resp)
 	if err != nil {
 		f.logger.Error(err.Error())
@@ -684,7 +681,7 @@ func (f *Frontend) ArmSubscriptionPut(writer http.ResponseWriter, request *http.
 	}
 
 	f.metrics.EmitGauge("subscription_lifecycle", 1, map[string]string{
-		"region":         f.region,
+		"location":       f.location,
 		"subscriptionid": subscriptionID,
 		"state":          string(subscription.State),
 	})
@@ -952,14 +949,13 @@ func (f *Frontend) CreateNodePool(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
+	writer.WriteHeader(http.StatusCreated)
 	_, err = writer.Write(resp)
 	if err != nil {
 		f.logger.Error(err.Error())
 		arm.WriteInternalServerError(writer)
 		return
 	}
-
-	writer.WriteHeader(http.StatusCreated)
 }
 
 func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request) {
@@ -1044,8 +1040,6 @@ func (f *Frontend) GetNodePool(writer http.ResponseWriter, request *http.Request
 	if err != nil {
 		f.logger.Error(err.Error())
 	}
-
-	writer.WriteHeader(http.StatusOK)
 }
 
 func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Request) {
@@ -1078,9 +1072,7 @@ func (f *Frontend) DeleteNodePool(writer http.ResponseWriter, request *http.Requ
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			f.logger.Error(fmt.Sprintf("existing document not found for cluster %s when deleting node pool", clusterResourceID))
-
-			originalPath, _ := OriginalPathFromContext(ctx)
-			arm.WriteResourceNotFoundError(writer, originalPath)
+			arm.WriteResourceNotFoundError(writer, nodePoolResourceID)
 			return
 		}
 		f.logger.Error(fmt.Sprintf("failed to fetch cluster document for %s when deleting node pool: %v", clusterResourceID, err))
